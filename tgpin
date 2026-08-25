@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Pin THIS terminal's Claude session to the Telegram bot.
+#
+# The bot lives exactly as long as this session: it starts when Claude starts and
+# dies when you close it. Nothing is always-on any more — no permanent tmux
+# session, no poller running in the background between uses.
+#
+#   tgpin                 # pin a session in the current directory
+#   tgpin --continue      # ...resuming the last conversation here
+#
+# Run it inside tmux if you want the session to survive an SSH drop.
+set -uo pipefail
+
+STATE_DIR="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
+LOCK="$STATE_DIR/pinned.lock"
+POLLER=telegram-mcp.service
+mkdir -p "$STATE_DIR"
+
+# One session owns the bot. Refuse rather than fight over the same updates —
+# two pollers on one token 409 against each other and messages land at random.
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "Telegram is already pinned to pid $(cat "$LOCK")." >&2
+  echo "Close that session first, or: kill $(cat "$LOCK")" >&2
+  exit 1
+fi
+rm -f "$LOCK"
+
+# The proxy consumes this file to claim the pin. Clearing it on exit stops an
+# unrelated Claude session picking up a leftover request and stealing the bot.
+: > "$STATE_DIR/pin.request"
+trap 'rm -f "$STATE_DIR/pin.request"; systemctl --user stop "$POLLER" 2>/dev/null' EXIT
+
+export TELEGRAM_PIN=1
+# Default tg sessions to manual mode: every tool use surfaces as an approve/deny
+# button in Telegram instead of running unattended.
+claude --permission-mode default --dangerously-load-development-channels server:telegram-proxy "$@"

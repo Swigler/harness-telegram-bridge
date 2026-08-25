@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram MCP Server for Claude Code
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.claude/telegram-server
+Environment="PATH=%h/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=%h/.bun/bin/bun server.ts
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
