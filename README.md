@@ -117,9 +117,13 @@ tg              # start Claude with Telegram bridge
 tg --continue   # resume the last conversation
 ```
 
-### Portable access (tmux + Tailscale)
+### Portable access (tmux + Tailscale + Termius)
 
-The real power is running this over SSH from your phone:
+The real power is running this over SSH from your phone. The stack:
+
+- **[Tailscale](https://tailscale.com)** — mesh VPN. Your phone and machine see each other on a private network, no port forwarding, no public IP needed. Free for personal use.
+- **[Termius](https://termius.com)** — SSH client for Android/iOS. Supports key auth, persistent sessions, and Tailscale addresses. Free tier is enough.
+- **tmux** — terminal multiplexer. The session survives SSH disconnects.
 
 ```bash
 # On your machine (once):
@@ -128,12 +132,14 @@ tg
 
 # Detach: Ctrl+B, then D
 
-# From your phone (Termius/JuiceSSH over Tailscale):
+# From your phone (Termius → Tailscale IP):
 ssh your-machine
 tmux attach -t claude
 ```
 
 The bot stays live as long as the tmux session exists. SSH drops don't kill it. Close the tmux session and the bot dies — by design.
+
+**The workflow:** You're on the bus, open Termius on your phone, SSH into your machine over Tailscale, attach to the tmux session — Claude is live on Telegram. Close Termius, the tmux session persists, the bot keeps running. You pick it back up later from anywhere.
 
 ### Permission handling
 
