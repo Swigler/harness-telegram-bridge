@@ -121,8 +121,8 @@ tg --continue   # resume the last conversation
 
 The real power is running this over SSH from your phone. The stack:
 
-- **[Tailscale](https://tailscale.com)** — mesh VPN. Your phone and machine see each other on a private network, no port forwarding, no public IP needed. Free for personal use.
-- **[Termius](https://termius.com)** — SSH client for Android/iOS. Supports key auth, persistent sessions, and Tailscale addresses. Free tier is enough.
+- **[Tailscale](https://tailscale.com)** — mesh VPN. Your phone and machine see each other on a private network, no port forwarding, no public IP needed. Personal plan included.
+- **[Termius](https://termius.com)** — SSH client for Android/iOS. Supports key auth, persistent sessions, and Tailscale addresses. Starter plan is enough.
 - **tmux** — terminal multiplexer. The session survives SSH disconnects.
 
 ```bash
