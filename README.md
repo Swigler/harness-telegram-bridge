@@ -147,6 +147,76 @@ Tool calls surface as approve/deny buttons in Telegram. The session runs in `--p
 
 ---
 
+## Multi-Agent Setup
+
+Run multiple Claude Code agents, each with its own Telegram bot. Every agent gets an isolated `tgpin` session — no token conflicts, no 409 errors.
+
+### Per-agent launch script
+
+Create a `tg` script for each agent:
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Point to this agent's state dir (holds .env with its unique bot token + access.json)
+export TELEGRAM_STATE_DIR="$HOME/agents/myagent/.telegram"
+export TELEGRAM_MCP_PORT=3457
+export TELEGRAM_MCP_URL="http://localhost:3457"
+
+cd "$HOME/agents/myagent/workspace"
+exec "$HOME/bin/tgpin" "$@"
+```
+
+### Per-agent state dir
+
+Each agent needs its own `.telegram/` directory with a unique bot token:
+
+```bash
+mkdir -p ~/agents/myagent/.telegram
+echo "TELEGRAM_BOT_TOKEN=YOUR_AGENT_TOKEN" > ~/agents/myagent/.telegram/.env
+chmod 600 ~/agents/myagent/.telegram/.env
+
+cat > ~/agents/myagent/.telegram/access.json << 'EOF'
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["YOUR_TELEGRAM_USER_ID"],
+  "groups": {}
+}
+EOF
+```
+
+### Port allocation
+
+Each agent must use a unique port. The built-in `server:telegram-proxy` channel reads `TELEGRAM_MCP_PORT` from the environment.
+
+| Port | Agent |
+|------|-------|
+| 3456 | Boss (default) |
+| 3457 | Agent 1 |
+| 3458 | Agent 2 |
+| ... | ... |
+
+### How it works
+
+`tgpin` already reads `TELEGRAM_STATE_DIR` from the environment. When you export it before calling `tgpin`, the built-in channel starts `server.ts` with the correct bot token on the correct port. No manual `server.ts` needed — one process, one token, full isolation.
+
+**Important:** Do NOT start a manual `server.ts` alongside `tgpin`. The built-in channel handles everything. Starting both creates two pollers on the same token, causing 409 conflicts and lost messages.
+
+### Spin up / kill
+
+```bash
+# Launch agent in tmux
+tmux new-session -d -s myagent "$HOME/agents/myagent/tg"
+
+# Kill agent
+tmux kill-session -t myagent
+```
+
+Each agent is fully independent. Kill one, the others keep running. Scale to as many agents as you have bot tokens.
+
+---
+
 ## Architecture Decisions
 
 ### Why session-pinned?

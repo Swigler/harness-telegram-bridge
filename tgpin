@@ -31,6 +31,7 @@ rm -f "$LOCK"
 trap 'rm -f "$STATE_DIR/pin.request"; systemctl --user stop "$POLLER" 2>/dev/null' EXIT
 
 export TELEGRAM_PIN=1
-# Default tg sessions to manual mode: every tool use surfaces as an approve/deny
-# button in Telegram instead of running unattended.
-claude --permission-mode default --dangerously-load-development-channels server:telegram-proxy "$@"
+# acceptEdits: file writes auto-approve, destructive ops still prompt.
+# --model opus: avoid long-context 429s on default model.
+# Both placed before "$@" so an explicit flag you pass still wins.
+claude --model opus --permission-mode acceptEdits --dangerously-load-development-channels server:telegram-proxy "$@"
