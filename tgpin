@@ -1,37 +1,84 @@
 #!/usr/bin/env bash
-# Pin THIS terminal's Claude session to the Telegram bot.
+# Pin THIS terminal's Claude session to a Telegram bot.
 #
-# The bot lives exactly as long as this session: it starts when Claude starts and
-# dies when you close it. Nothing is always-on any more — no permanent tmux
-# session, no poller running in the background between uses.
+# Usage:
+#   tgpin              # default bot (first in bots.json, or legacy single-bot)
+#   tgpin mybot        # pin to the "mybot" bot
+#   tgpin worker1      # pin to the "worker1" bot
+#   tgpin mybot --continue   # resume last conversation
 #
-#   tgpin                 # pin a session in the current directory
-#   tgpin --continue      # ...resuming the last conversation here
-#
-# Run it inside tmux if you want the session to survive an SSH drop.
+# Each bot gets its own poller, state dir, and port. Multiple bots run
+# concurrently — one poller per token, always.
 set -uo pipefail
 
-STATE_DIR="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
-LOCK="$STATE_DIR/pinned.lock"
-POLLER=telegram-mcp.service
+BASE_DIR="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
+BOTS_JSON="$BASE_DIR/bots.json"
+
+# ── Resolve bot name ──────────────────────────────────────────────────────
+BOT_NAME=""
+EXTRA_ARGS=()
+for arg in "$@"; do
+  if [[ -z "$BOT_NAME" && "$arg" != -* ]]; then
+    BOT_NAME="$arg"
+  else
+    EXTRA_ARGS+=("$arg")
+  fi
+done
+
+# If bots.json doesn't exist, fall back to legacy single-bot mode
+if [[ ! -f "$BOTS_JSON" ]]; then
+  if [[ -n "$BOT_NAME" ]]; then
+    echo "No bots.json found — can't resolve bot '$BOT_NAME'." >&2
+    echo "Create $BOTS_JSON or run without a bot name for legacy mode." >&2
+    exit 1
+  fi
+  # Legacy: original single-bot behavior
+  STATE_DIR="$BASE_DIR"
+  LOCK="$STATE_DIR/pinned.lock"
+  POLLER_UNIT="telegram-mcp.service"
+  PORT=3456
+else
+  # Multi-bot mode
+  if [[ -z "$BOT_NAME" ]]; then
+    BOT_NAME=$(bun -e "console.log(Object.keys(JSON.parse(require('fs').readFileSync('$BOTS_JSON','utf8')))[0])")
+  fi
+  PORT=$(bun -e "const b=JSON.parse(require('fs').readFileSync('$BOTS_JSON','utf8'));if(!b['$BOT_NAME']){process.stderr.write('Unknown bot: $BOT_NAME\nAvailable: '+Object.keys(b).join(', ')+'\n');process.exit(1)}console.log(b['$BOT_NAME'].port)")
+  if [[ $? -ne 0 ]]; then exit 1; fi
+
+  STATE_DIR="$BASE_DIR/$BOT_NAME"
+  LOCK="$STATE_DIR/pinned.lock"
+  POLLER_UNIT="telegram-mcp@${BOT_NAME}.service"
+fi
+
 mkdir -p "$STATE_DIR"
 
-# One session owns the bot. Refuse rather than fight over the same updates —
-# two pollers on one token 409 against each other and messages land at random.
+# Check .env exists for this bot
+if [[ ! -f "$STATE_DIR/.env" ]]; then
+  echo "No .env found at $STATE_DIR/.env" >&2
+  echo "Create it with: TELEGRAM_BOT_TOKEN=your_token" >&2
+  [[ -n "${PORT:-}" ]] && echo "           and: TELEGRAM_MCP_PORT=$PORT" >&2
+  exit 1
+fi
+
+# One session owns the bot. Refuse rather than fight.
 if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
-  echo "Telegram is already pinned to pid $(cat "$LOCK")." >&2
+  echo "Bot '$BOT_NAME' is already pinned to pid $(cat "$LOCK")." >&2
   echo "Close that session first, or: kill $(cat "$LOCK")" >&2
   exit 1
 fi
 rm -f "$LOCK"
 
-# The proxy consumes this file to claim the pin. Clearing it on exit stops an
-# unrelated Claude session picking up a leftover request and stealing the bot.
 : > "$STATE_DIR/pin.request"
-trap 'rm -f "$STATE_DIR/pin.request"; systemctl --user stop "$POLLER" 2>/dev/null' EXIT
+trap 'rm -f "$STATE_DIR/pin.request"; systemctl --user stop "$POLLER_UNIT" 2>/dev/null' EXIT
 
 export TELEGRAM_PIN=1
+export TELEGRAM_STATE_DIR="$STATE_DIR"
+export TELEGRAM_MCP_PORT="$PORT"
+export TELEGRAM_MCP_URL="http://localhost:$PORT"
+export TELEGRAM_POLLER_UNIT="$POLLER_UNIT"
+
+echo "Pinning bot '${BOT_NAME:-default}' on port $PORT (state: $STATE_DIR)"
 # acceptEdits: file writes auto-approve, destructive ops still prompt.
 # --model opus: avoid long-context 429s on default model.
-# Both placed before "$@" so an explicit flag you pass still wins.
-claude --model opus --permission-mode acceptEdits --dangerously-load-development-channels server:telegram-proxy "$@"
+# Both placed before "${EXTRA_ARGS[@]}" so an explicit flag you pass still wins.
+claude --model opus --permission-mode acceptEdits --dangerously-load-development-channels server:telegram-proxy "${EXTRA_ARGS[@]}"

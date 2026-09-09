@@ -54,7 +54,7 @@ const bot = new Bot(TOKEN)
 // sessions fighting over the same updates (one poller per token, always).
 const LOCK_FILE = join(STATE_DIR, 'pinned.lock')
 const PIN_REQUEST = join(STATE_DIR, 'pin.request')
-const POLLER_UNIT = 'telegram-mcp.service'
+const POLLER_UNIT = process.env.TELEGRAM_POLLER_UNIT ?? 'telegram-mcp.service'
 
 function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch { return false }
@@ -118,12 +118,12 @@ if (PINNED) {
 }
 
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
-function loadAccess(): { allowFrom: string[] } {
+function loadAccess(): { allowFrom: string[]; groups?: Record<string, unknown> } {
   try { return JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) } catch { return { allowFrom: [] } }
 }
 function assertAllowedChat(chat_id: string): void {
   const access = loadAccess()
-  if (!access.allowFrom.includes(chat_id)) throw new Error(`chat_id ${chat_id} not in allowlist`)
+  if (!access.allowFrom.includes(chat_id) && !access.groups?.[chat_id]) throw new Error(`chat_id ${chat_id} not in allowlist`)
 }
 
 const MAX_CHUNK = 4000

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram MCP Server — %i bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.claude/telegram-server
+Environment="PATH=%h/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TELEGRAM_STATE_DIR=%h/.claude/channels/telegram/%i"
+ExecStart=%h/.bun/bin/bun server.ts
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
