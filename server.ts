@@ -592,7 +592,15 @@ const MAX_QUEUE = 500
 function pushNotification(notification: unknown): void {
   if (sseClients.size > 0) {
     const data = `data: ${JSON.stringify(notification)}\n\n`
-    for (const client of sseClients) client.write(data)
+    let delivered = false
+    for (const client of sseClients) {
+      try { client.write(data); delivered = true } catch { sseClients.delete(client) }
+    }
+    // If all clients were zombies, queue the message so the next reconnect gets it
+    if (!delivered) {
+      pendingNotifications.push(notification)
+      if (pendingNotifications.length > MAX_QUEUE) pendingNotifications.shift()
+    }
   } else {
     pendingNotifications.push(notification)
     if (pendingNotifications.length > MAX_QUEUE) pendingNotifications.shift()
@@ -627,7 +635,12 @@ app.get('/events', (req, res) => {
   for (const n of pendingNotifications.splice(0)) {
     res.write(`data: ${JSON.stringify(n)}\n\n`)
   }
+  // Heartbeat — SSE comment every 15s so proxy can detect dead connections
+  const heartbeat = setInterval(() => {
+    try { res.write(':ping\n\n') } catch { clearInterval(heartbeat) }
+  }, 15_000)
   req.on('close', () => {
+    clearInterval(heartbeat)
     sseClients.delete(res)
     process.stderr.write(`telegram channel: proxy disconnected (${sseClients.size} clients)\n`)
   })

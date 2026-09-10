@@ -45,77 +45,81 @@ if (!TOKEN) {
 const bot = new Bot(TOKEN)
 
 // ── Pin ─────────────────────────────────────────────────────────────────────
-// The bot lives exactly as long as the pinned session. One Claude session claims
-// it, gets every inbound message, and takes the poller down with it on exit —
-// so closing the session kills the bot until another one pins.
-//
-// Only the pinned proxy starts the poller and subscribes to /events. Every other
-// session keeps the outbound tools but stays deaf, which is what stops two
-// sessions fighting over the same updates (one poller per token, always).
+// tgpin ensures only one Claude session per bot. The proxy just needs to own the
+// lockfile so it can start/stop the poller and subscribe to SSE. No pin.request
+// file — the lockfile alone is the source of truth. Re-checked on every SSE
+// reconnect so a respawned proxy (after /clear) can re-acquire a stale lock.
 const LOCK_FILE = join(STATE_DIR, 'pinned.lock')
-const PIN_REQUEST = join(STATE_DIR, 'pin.request')
 const POLLER_UNIT = process.env.TELEGRAM_POLLER_UNIT ?? 'telegram-mcp.service'
+
+// SSE heartbeat timeout — if server sends nothing for this long, reconnect.
+const HEARTBEAT_TIMEOUT_MS = 30_000
 
 function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
-// Two ways to ask for the pin: TELEGRAM_PIN=1, or a request file dropped by the
-// launcher. The file is the reliable one — env vars do not always survive the
-// MCP spawn — and unlink is atomic, so only one proxy can ever consume it.
-function wantsPin(): boolean {
-  if (process.env.TELEGRAM_PIN === '1') return true
-  try { unlinkSync(PIN_REQUEST); return true } catch { return false }
-}
-
+/** Try to own the lockfile. Clears stale locks from dead processes. */
 function acquirePin(): boolean {
   mkdirSync(STATE_DIR, { recursive: true })
+
+  // Already ours?
+  try {
+    const holder = Number(readFileSync(LOCK_FILE, 'utf8').trim())
+    if (holder === process.pid) return true
+  } catch {}
+
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fd = openSync(LOCK_FILE, 'wx')   // 'wx' fails if the lock exists
+      const fd = openSync(LOCK_FILE, 'wx')
       writeSync(fd, String(process.pid))
       closeSync(fd)
       return true
     } catch {
-      // Held by someone. If that someone is gone, clear the stale lock and retry
-      // once — a killed session must not lock the bot out forever.
       try {
         const holder = Number(readFileSync(LOCK_FILE, 'utf8').trim())
-        if (!holder || !pidAlive(holder)) { unlinkSync(LOCK_FILE); continue }
-      } catch {}
+        if (!Number.isFinite(holder) || !pidAlive(holder)) { unlinkSync(LOCK_FILE); continue }
+      } catch { unlinkSync(LOCK_FILE); continue }
       return false
     }
   }
   return false
 }
 
-const PINNED = wantsPin() && acquirePin()
-
-let released = false
 function releasePin(): void {
-  if (!PINNED || released) return
-  released = true
+  let owned = false
   try {
-    if (Number(readFileSync(LOCK_FILE, 'utf8').trim()) === process.pid) unlinkSync(LOCK_FILE)
+    owned = Number(readFileSync(LOCK_FILE, 'utf8').trim()) === process.pid
+    if (owned) unlinkSync(LOCK_FILE)
   } catch {}
-  // Kill the bot. Stopping the unit also drops the server's queued notifications,
-  // so a later session pins to silence instead of a backlog flood.
-  spawnSync('systemctl', ['--user', 'stop', POLLER_UNIT], { stdio: 'ignore' })
-  process.stderr.write('telegram proxy: unpinned — bot stopped\n')
+  if (owned) {
+    spawnSync('systemctl', ['--user', 'stop', POLLER_UNIT], { stdio: 'ignore' })
+    process.stderr.write('telegram proxy: unpinned — bot stopped\n')
+  }
 }
 
-if (PINNED) {
+// Try to pin immediately. If it fails now, sseLoop will retry on each reconnect.
+let pinned = acquirePin()
+
+if (pinned) {
   spawnSync('systemctl', ['--user', 'start', POLLER_UNIT], { stdio: 'ignore' })
   process.stderr.write(`telegram proxy: PINNED (pid ${process.pid}) — bot is live\n`)
-  process.on('exit', releasePin)
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-    process.on(sig, () => { releasePin(); process.exit(0) })
-  }
-  // Claude closing stdio is the normal end of a session.
-  process.stdin.on('close', () => { releasePin(); process.exit(0) })
 } else {
-  process.stderr.write('telegram proxy: not pinned — outbound tools only\n')
+  process.stderr.write('telegram proxy: not pinned yet — will retry on SSE reconnect\n')
 }
+
+// Cleanup on exit — releasePin is safe to call even if not owner (it checks)
+let released = false
+function cleanup(): void {
+  if (released) return
+  released = true
+  releasePin()
+}
+process.on('exit', cleanup)
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  process.on(sig, () => { cleanup(); process.exit(0) })
+}
+process.stdin.on('close', () => { cleanup(); process.exit(0) })
 
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 function loadAccess(): { allowFrom: string[]; groups?: Record<string, unknown> } {
@@ -139,7 +143,7 @@ function chunk(text: string, limit: number): string[] {
     const para = rest.lastIndexOf('\n\n', limit)
     const line = rest.lastIndexOf('\n', limit)
     const space = rest.lastIndexOf(' ', limit)
-    cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
+    cut = para > limit / 2 ? para : line > limit / 2 ? line : space > limit / 2 ? space : limit
     out.push(rest.slice(0, cut))
     rest = rest.slice(cut).replace(/^\n+/, '')
   }
@@ -327,27 +331,60 @@ server.setNotificationHandler(
 
 await server.connect(new StdioServerTransport())
 
-// SSE loop — receive inbound Telegram notifications and push to Claude
+// SSE loop — receive inbound Telegram notifications and push to Claude.
+// Re-acquires pin on every reconnect so a respawned proxy (after /clear) recovers.
 async function sseConnect(): Promise<void> {
-  const res = await fetch(`${HTTP_SERVER}/events`)
+  // (Re-)acquire pin before connecting. If stale lock from dead process, take over.
+  if (!pinned) {
+    pinned = acquirePin()
+    if (pinned) {
+      spawnSync('systemctl', ['--user', 'start', POLLER_UNIT], { stdio: 'ignore' })
+      process.stderr.write(`telegram proxy: re-acquired pin (pid ${process.pid}) — bot is live\n`)
+    } else {
+      throw new Error('cannot acquire pin — another session holds it')
+    }
+  }
+
+  const controller = new AbortController()
+  const res = await fetch(`${HTTP_SERVER}/events`, { signal: controller.signal })
   if (!res.ok || !res.body) throw new Error(`SSE connect failed: ${res.status}`)
   process.stderr.write('telegram proxy: SSE connected\n')
+
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue
-      try {
-        const notification = JSON.parse(line.slice(6))
-        server.notification(notification).catch(() => {})
-      } catch {}
+
+  // Heartbeat watchdog — server sends :ping every 15s. If nothing in 30s, abort.
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+  function resetHeartbeat(): void {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer)
+    heartbeatTimer = setTimeout(() => {
+      process.stderr.write('telegram proxy: heartbeat timeout — forcing reconnect\n')
+      controller.abort()
+    }, HEARTBEAT_TIMEOUT_MS)
+  }
+  resetHeartbeat()
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      resetHeartbeat()
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.startsWith(':')) continue  // SSE comment (heartbeat ping)
+        if (!line.startsWith('data: ')) continue
+        try {
+          const notification = JSON.parse(line.slice(6))
+          server.notification(notification).catch(() => {})
+        } catch {}
+      }
     }
+  } finally {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer)
+    reader.cancel().catch(() => {})
   }
 }
 
@@ -355,13 +392,19 @@ async function sseLoop(): Promise<void> {
   while (true) {
     try {
       await sseConnect()
+      process.stderr.write('telegram proxy: SSE stream ended, reconnecting in 2s\n')
     } catch (err) {
-      process.stderr.write(`telegram proxy: SSE error (${err}), reconnecting in 2s\n`)
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('cannot acquire pin')) {
+        process.stderr.write(`telegram proxy: ${msg} — will retry in 10s\n`)
+        await new Promise(r => setTimeout(r, 10_000))
+        continue
+      }
+      process.stderr.write(`telegram proxy: SSE error (${msg}), reconnecting in 2s\n`)
     }
     await new Promise(r => setTimeout(r, 2000))
   }
 }
 
-// Unpinned sessions never subscribe — otherwise they steal messages meant for
-// the pinned one, which is the old "bot types, then goes silent" failure.
-if (PINNED) void sseLoop()
+// Always start the SSE loop. It will acquire the pin on first connect (or retry).
+void sseLoop()

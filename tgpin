@@ -10,6 +10,7 @@
 # Each bot gets its own poller, state dir, and port. Multiple bots run
 # concurrently — one poller per token, always.
 set -uo pipefail
+export PATH="$HOME/.bun/bin:$PATH"
 
 BASE_DIR="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
 BOTS_JSON="$BASE_DIR/bots.json"
@@ -68,8 +69,7 @@ if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
 fi
 rm -f "$LOCK"
 
-: > "$STATE_DIR/pin.request"
-trap 'rm -f "$STATE_DIR/pin.request"; systemctl --user stop "$POLLER_UNIT" 2>/dev/null' EXIT
+trap 'systemctl --user stop "$POLLER_UNIT" 2>/dev/null' EXIT
 
 export TELEGRAM_PIN=1
 export TELEGRAM_STATE_DIR="$STATE_DIR"
