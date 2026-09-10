@@ -406,5 +406,10 @@ async function sseLoop(): Promise<void> {
   }
 }
 
-// Always start the SSE loop. It will acquire the pin on first connect (or retry).
-void sseLoop()
+// Always start the SSE loop. Restart if the promise ever escapes the inner try/catch.
+;(function keepAlive() {
+  sseLoop().catch(err => {
+    process.stderr.write(`telegram proxy: sseLoop crashed (${err}), restarting in 5s\n`)
+    setTimeout(keepAlive, 5000)
+  })
+})()
