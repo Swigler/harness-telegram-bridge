@@ -53,7 +53,8 @@ const LOCK_FILE = join(STATE_DIR, 'pinned.lock')
 const POLLER_UNIT = process.env.TELEGRAM_POLLER_UNIT ?? 'telegram-mcp.service'
 
 // SSE heartbeat timeout — if server sends nothing for this long, reconnect.
-const HEARTBEAT_TIMEOUT_MS = 30_000
+// ponytail: heartbeat watchdog removed — bun's fetch reader buffers small
+// chunks (like :ping), so the watchdog always timed out and killed the connection
 
 function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch { return false }
@@ -93,8 +94,8 @@ function releasePin(): void {
     if (owned) unlinkSync(LOCK_FILE)
   } catch {}
   if (owned) {
-    spawnSync('systemctl', ['--user', 'stop', POLLER_UNIT], { stdio: 'ignore' })
-    process.stderr.write('telegram proxy: unpinned — bot stopped\n')
+    // Poller stays up — decoupled from session lifetime (2026-09-10).
+    process.stderr.write('telegram proxy: unpinned — poller stays up\n')
   }
 }
 
@@ -102,7 +103,6 @@ function releasePin(): void {
 let pinned = acquirePin()
 
 if (pinned) {
-  spawnSync('systemctl', ['--user', 'start', POLLER_UNIT], { stdio: 'ignore' })
   process.stderr.write(`telegram proxy: PINNED (pid ${process.pid}) — bot is live\n`)
 } else {
   process.stderr.write('telegram proxy: not pinned yet — will retry on SSE reconnect\n')
@@ -338,15 +338,13 @@ async function sseConnect(): Promise<void> {
   if (!pinned) {
     pinned = acquirePin()
     if (pinned) {
-      spawnSync('systemctl', ['--user', 'start', POLLER_UNIT], { stdio: 'ignore' })
       process.stderr.write(`telegram proxy: re-acquired pin (pid ${process.pid}) — bot is live\n`)
     } else {
       throw new Error('cannot acquire pin — another session holds it')
     }
   }
 
-  const controller = new AbortController()
-  const res = await fetch(`${HTTP_SERVER}/events`, { signal: controller.signal })
+  const res = await fetch(`${HTTP_SERVER}/events`)
   if (!res.ok || !res.body) throw new Error(`SSE connect failed: ${res.status}`)
   process.stderr.write('telegram proxy: SSE connected\n')
 
@@ -354,22 +352,10 @@ async function sseConnect(): Promise<void> {
   const decoder = new TextDecoder()
   let buffer = ''
 
-  // Heartbeat watchdog — server sends :ping every 15s. If nothing in 30s, abort.
-  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
-  function resetHeartbeat(): void {
-    if (heartbeatTimer) clearTimeout(heartbeatTimer)
-    heartbeatTimer = setTimeout(() => {
-      process.stderr.write('telegram proxy: heartbeat timeout — forcing reconnect\n')
-      controller.abort()
-    }, HEARTBEAT_TIMEOUT_MS)
-  }
-  resetHeartbeat()
-
   try {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-      resetHeartbeat()
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
@@ -383,7 +369,6 @@ async function sseConnect(): Promise<void> {
       }
     }
   } finally {
-    if (heartbeatTimer) clearTimeout(heartbeatTimer)
     reader.cancel().catch(() => {})
   }
 }
