@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# OpenCode runtime for tg.
+# Starts a private opencode server in $PWD, writes the opencode-telegram-bot .env, then launches.
+set -uo pipefail
+
+# Load bot token from the bot's .env
+source "$TELEGRAM_STATE_DIR/.env"
+
+# opencode-telegram-bot does its own Telegram polling.
+# Stop our poller so they don't fight over the same token (409).
+systemctl --user stop "$TELEGRAM_POLLER_UNIT" 2>/dev/null
+
+# Our own server, rooted where tg was called from. NEVER reuse a server we didn't start:
+# `opencode serve` pins every session to ITS cwd, so a shared one on a fixed port silently
+# drops you into that server's folder (this is why sessions kept landing in agents/coder/workspace).
+# --port 0 = kernel picks a free port, so two bots can't collide either.
+LOG="$TELEGRAM_STATE_DIR/opencode-serve.log"
+: > "$LOG"
+opencode serve --port 0 >>"$LOG" 2>&1 &
+OC_PID=$!
+
+trap 'kill "$OC_PID" 2>/dev/null; systemctl --user start "$TELEGRAM_POLLER_UNIT" 2>/dev/null' EXIT
+
+# Wait for it to announce its port (10s ceiling)
+OPENCODE_URL=""
+for _ in $(seq 1 100); do
+  OPENCODE_URL=$(grep -o -m1 'http://127\.0\.0\.1:[0-9]\+' "$LOG" 2>/dev/null)
+  [[ -n "$OPENCODE_URL" ]] && break
+  if ! kill -0 "$OC_PID" 2>/dev/null; then
+    echo "opencode serve died on startup:" >&2
+    cat "$LOG" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [[ -z "$OPENCODE_URL" ]]; then
+  echo "opencode serve never reported a port — see $LOG" >&2
+  exit 1
+fi
+
+# opencode-telegram-bot has its own single-user allowlist — take it from access.json
+# rather than hardcoding an ID, so the two allowlists can't drift apart.
+ALLOWED_ID=$(python3 -c "import json;print(json.load(open('$TELEGRAM_STATE_DIR/access.json'))['allowFrom'][0])" 2>/dev/null)
+if [[ -z "$ALLOWED_ID" ]]; then
+  echo "No allowFrom[0] in $TELEGRAM_STATE_DIR/access.json — refusing to start an unguarded bot." >&2
+  exit 1
+fi
+
+# The server we just started takes no password; the bot still wants the field set.
+# Random per session — never ship a default one.
+OC_PASSWORD="${OPENCODE_SERVER_PASSWORD:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=')}"
+
+# Write the opencode-telegram-bot config so the wizard never triggers
+CONFIG_DIR="$HOME/.config/opencode-telegram-bot"
+mkdir -p "$CONFIG_DIR"
+cat > "$CONFIG_DIR/.env" << EOF
+BOT_LOCALE=en
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+TELEGRAM_ALLOWED_USER_ID=$ALLOWED_ID
+OPENCODE_API_URL=$OPENCODE_URL
+OPENCODE_SERVER_PASSWORD=$OC_PASSWORD
+OPENCODE_MODEL_PROVIDER=${OPENCODE_MODEL_PROVIDER:-litellm}
+OPENCODE_MODEL_ID=${OPENCODE_MODEL_ID:-fast}
+EOF
+
+echo "tg: opencode serve → $OPENCODE_URL (cwd $PWD)"
+npx --yes @grinev/opencode-telegram-bot start "$@"

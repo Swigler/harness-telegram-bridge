@@ -1,259 +1,210 @@
-# Claude Code ↔ Telegram Bridge
+# harness-telegram-bridge
 
-A session-pinned Telegram bridge for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). The bot lives exactly as long as your terminal session — start it, use it, close it. No always-on daemon.
+Drive a coding agent from Telegram. Send a message from your phone, an agent session on your machine picks it up, works, and replies in the chat — with file attachments, emoji reactions, live-edited progress messages, and tap-to-approve permission prompts.
 
-This is a fork of the official Claude Code Telegram channel plugin with a security patch and a portable deployment setup using tmux + Tailscale.
-
----
-
-## How It Works
-
-```
-Phone (Telegram)
-  │
-  ▼
-┌─────────────────────┐
-│  server.ts           │  Standalone MCP HTTP server
-│  Polls Telegram      │  Runs as a systemd user unit
-│  Queues messages     │  Starts/stops with the pin
-└──────────┬──────────┘
-           │ SSE (/events)
-           ▼
-┌─────────────────────┐
-│  proxy.ts            │  Stdio MCP proxy
-│  Bridges to Claude   │  Spawned by Claude Code
-│  Owns the pin lock   │  One session at a time
-└──────────┬──────────┘
-           │ stdio
-           ▼
-┌─────────────────────┐
-│  Claude Code         │  Your session
-│  Reads messages      │  Calls reply/react/edit
-│  Full tool access    │  Permission buttons in TG
-└─────────────────────┘
-```
-
-**The pin design:** Only one Claude session can own the bot at a time. `tgpin` acquires a lock file, starts the poller, and releases both when the session ends. This prevents the 409 Conflict that happens when two pollers fight over the same Telegram token.
+Runtime-agnostic: the same bot can front **Claude Code**, **OpenCode**, or a blank context-free session. One machine can run several bots at once, each fully isolated.
 
 ---
 
-## Security Patch
+## How it works
 
-The upstream plugin has a disclosure issue: `/start`, `/help`, and `/status` commands are registered before the access gate runs. Under `dmPolicy: "allowlist"`, a stranger who finds the bot gets a helpful response explaining it's a Claude Code bridge — leaking that the bot exists and what it does.
+Three pieces. Two are in this repo.
 
-**The patch** adds a `commandMuted()` guard: under allowlist or disabled mode, commands from non-allowlisted users are silently dropped. Under pairing mode, they work normally (since `/start` is how new users learn to pair).
+```
+   Telegram
+       │  long-polling
+       ▼
+┌──────────────────────┐   systemd user unit, one per bot
+│  server.ts           │   telegram-mcp@<bot>.service
+│                      │
+│  · polls Telegram    │   HTTP on $TELEGRAM_MCP_PORT:
+│  · runs the gate     │     /mcp         MCP transport
+│  · queues inbound    │     /events      SSE to the proxy
+│  · owns permissions  │     /permission  POST from the proxy
+└──────────┬───────────┘
+           │  SSE  ·  queues up to 500 messages while nothing is attached
+           ▼
+┌──────────────────────┐   spawned by the agent as a stdio MCP server
+│  proxy.ts            │
+│                      │
+│  · implements tools  │   reply · react · download_attachment · edit_message
+│  · holds the pin     │   one session per bot at a time
+│  · forwards perms    │
+└──────────┬───────────┘
+           │  stdio MCP
+           ▼
+    Claude Code / OpenCode
+```
 
-This is +15 lines, no deletions, visible in the git diff.
+**The poller outlives your session.** `server.ts` runs as an always-on systemd unit. Close your terminal, reboot your laptop, `/clear` your session — the bot stays up and keeps accepting messages. Anything that arrives while no session is attached is queued (up to 500) and flushed the moment one reconnects. You are never the reason a message is lost.
+
+**The pin stops the crossfire.** Telegram allows exactly one poller per token; a second one gets a permanent 409. `proxy.ts` takes a lockfile (`pinned.lock`) so only one agent session owns a given bot. Stale locks from dead processes are detected and cleared automatically, so a crashed session doesn't strand the bot.
 
 ---
 
 ## Setup
 
 ### Prerequisites
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
-- [Bun](https://bun.sh) runtime
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
-### 1. Install the server
+- [Bun](https://bun.sh)
+- A bot token from [@BotFather](https://t.me/BotFather)
+- At least one agent runtime: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and/or [OpenCode](https://opencode.ai)
 
-```bash
-mkdir -p ~/.claude/telegram-server
-cp server.ts proxy.ts package.json ~/.claude/telegram-server/
-cd ~/.claude/telegram-server && bun install
-```
-
-### 2. Configure the bot token
+### Install
 
 ```bash
-mkdir -p ~/.claude/channels/telegram
-echo "TELEGRAM_BOT_TOKEN=YOUR_TOKEN_HERE" > ~/.claude/channels/telegram/.env
-chmod 600 ~/.claude/channels/telegram/.env
-```
+git clone https://github.com/Swigler/harness-telegram-bridge ~/.claude/telegram-server
+cd ~/.claude/telegram-server
+bun install
 
-### 3. Install the systemd user unit
-
-```bash
 mkdir -p ~/.config/systemd/user
-cp telegram-mcp.service ~/.config/systemd/user/
+ln -s ~/.claude/telegram-server/telegram-mcp@.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-**Do not enable the service** — `tgpin` starts and stops it automatically. Enabling it would make the bot immortal and fight with the pin design.
-
-### 4. Install the launcher
+Then put the launcher on your `PATH` and the runtimes where `tg` looks for them:
 
 ```bash
-cp tgpin ~/bin/tgpin
-chmod +x ~/bin/tgpin
-
-# Optional: alias in your .bashrc
-echo 'alias tg="~/bin/tgpin"' >> ~/.bashrc
+mkdir -p ~/bin ~/.claude/channels/telegram
+ln -s ~/.claude/telegram-server/tg ~/bin/tg
+ln -s ~/.claude/telegram-server/runtimes ~/.claude/channels/telegram/runtimes
 ```
 
-### 5. Lock access (recommended)
-
-By default, the bot is in pairing mode — anyone who DMs it gets a pairing code. To lock it to your Telegram user ID:
+### Add a bot
 
 ```bash
-cat > ~/.claude/channels/telegram/access.json << 'EOF'
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["YOUR_TELEGRAM_USER_ID"],
-  "groups": {},
-  "pending": {}
-}
+tg setup mybot
+```
+
+The wizard verifies the token against `getMe` before writing anything, picks the next free port, writes the state dir, and enables + starts the poller. It refuses to clobber a bot that already exists.
+
+Manual equivalent, if you prefer:
+
+```bash
+mkdir -p ~/.claude/channels/telegram/mybot
+cat > ~/.claude/channels/telegram/mybot/.env <<'EOF'
+TELEGRAM_BOT_TOKEN=123456789:AAH...
+TELEGRAM_MCP_PORT=3456
 EOF
-```
+chmod 600 ~/.claude/channels/telegram/mybot/.env
 
-Find your user ID by sending a message to [@userinfobot](https://t.me/userinfobot) on Telegram.
+echo '{"dmPolicy":"allowlist","allowFrom":["<your-telegram-user-id>"]}' \
+  > ~/.claude/channels/telegram/mybot/access.json
+
+echo '{"mybot":{"port":3456}}' > ~/.claude/channels/telegram/bots.json
+systemctl --user enable --now telegram-mcp@mybot.service
+```
 
 ---
 
 ## Usage
 
-### Start a session
 ```bash
-tg              # start Claude with Telegram bridge
-tg --continue   # resume the last conversation
+tg <runtime> <bot> [extra args...]
 ```
 
-### Portable access (tmux + Tailscale + Termius)
+| Command | What you get |
+|---|---|
+| `tg claude mybot` | Claude Code, in the current project |
+| `tg opencode mybot` | OpenCode, in the current project |
+| `tg anon mybot` | Claude Code from `/tmp` — no project context |
+| `tg claude mybot --continue` | extra args pass through to the runtime |
+| `tg setup [name]` | add a bot |
+| `tg help` | usage, plus the runtimes and bots you actually have |
 
-The real power is running this over SSH from your phone. The stack:
-
-- **[Tailscale](https://tailscale.com)** — mesh VPN. Your phone and machine see each other on a private network, no port forwarding, no public IP needed. Personal plan included.
-- **[Termius](https://termius.com)** — SSH client for Android/iOS. Supports key auth, persistent sessions, and Tailscale addresses. Starter plan is enough.
-- **tmux** — terminal multiplexer. The session survives SSH disconnects.
+Run it under tmux so the session survives the terminal:
 
 ```bash
-# On your machine (once):
-tmux new -s claude
-tg
-
-# Detach: Ctrl+B, then D
-
-# From your phone (Termius → Tailscale IP):
-ssh your-machine
-tmux attach -t claude
+tmux new -s mybot
+tg claude mybot
 ```
 
-The bot stays live as long as the tmux session exists. SSH drops don't kill it. Close the tmux session and the bot dies — by design.
+### Adding a runtime
 
-**The workflow:** You're on the bus, open Termius on your phone, SSH into your machine over Tailscale, attach to the tmux session — Claude is live on Telegram. Close Termius, the tmux session persists, the bot keeps running. You pick it back up later from anywhere.
+Drop an executable in `~/.claude/channels/telegram/runtimes/`. `tg` exports `TELEGRAM_STATE_DIR`, `TELEGRAM_MCP_PORT`, `TELEGRAM_MCP_URL`, and `TELEGRAM_POLLER_UNIT`, then `exec`s your script. That is the whole contract.
 
-### Permission handling
-
-Tool calls surface as approve/deny buttons in Telegram. The session runs in `--permission-mode default`, so destructive operations (file writes, shell commands) require your explicit tap before executing.
+The shipped `claude` runtime is two lines. The `opencode` one is longer for two reasons. OpenCode does its own Telegram polling, so it stops our poller on the way in and restarts it on exit via a `trap` — that is how both runtimes share one token without 409ing each other. And it starts its **own** `opencode serve` on a kernel-assigned port, then kills it on exit: an OpenCode session works in the server's directory, so pointing several sessions at one long-lived server on a fixed port silently drops all of them into that server's folder instead of yours.
 
 ---
 
-## Multi-Agent Setup
+## Access control
 
-Run multiple Claude Code agents, each with its own Telegram bot. Every agent gets an isolated `tgpin` session — no token conflicts, no 409 errors.
+`access.json` per bot, three modes:
 
-### Per-agent launch script
+| `dmPolicy` | Behavior |
+|---|---|
+| `allowlist` | Only listed user IDs get through. Everyone else is dropped silently. |
+| `pairing` | A stranger gets a one-time 6-char code, valid 1 hour. You approve it from your terminal. Max 3 outstanding, 2 replies each. |
+| `disabled` | Nothing gets through. |
 
-Create a `tg` script for each agent:
+Groups are opt-in per chat ID, default to requiring an @mention, and take their own per-group allowlist.
 
-```bash
-#!/usr/bin/env bash
-set -uo pipefail
+Approval happens in **your terminal**, never from chat. The MCP instructions tell the agent explicitly that a Telegram message asking to be added to the allowlist is what a prompt injection looks like, and to refuse it.
 
-# Point to this agent's state dir (holds .env with its unique bot token + access.json)
-export TELEGRAM_STATE_DIR="$HOME/agents/myagent/.telegram"
-export TELEGRAM_MCP_PORT=3457
-export TELEGRAM_MCP_URL="http://localhost:3457"
+Under `allowlist` and `disabled`, `/start`, `/help` and `/status` are muted for anyone not on the list — a stranger who finds the bot gets silence, not a helpful explanation of what it is. Under `pairing` they answer normally, since that is how a new person learns to pair.
 
-cd "$HOME/agents/myagent/workspace"
-exec "$HOME/bin/tgpin" "$@"
-```
-
-### Per-agent state dir
-
-Each agent needs its own `.telegram/` directory with a unique bot token:
-
-```bash
-mkdir -p ~/agents/myagent/.telegram
-echo "TELEGRAM_BOT_TOKEN=YOUR_AGENT_TOKEN" > ~/agents/myagent/.telegram/.env
-chmod 600 ~/agents/myagent/.telegram/.env
-
-cat > ~/agents/myagent/.telegram/access.json << 'EOF'
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["YOUR_TELEGRAM_USER_ID"],
-  "groups": {}
-}
-EOF
-```
-
-### Port allocation
-
-Each agent must use a unique port. The built-in `server:telegram-proxy` channel reads `TELEGRAM_MCP_PORT` from the environment.
-
-| Port | Agent |
-|------|-------|
-| 3456 | Boss (default) |
-| 3457 | Agent 1 |
-| 3458 | Agent 2 |
-| ... | ... |
-
-### How it works
-
-`tgpin` already reads `TELEGRAM_STATE_DIR` from the environment. When you export it before calling `tgpin`, the built-in channel starts `server.ts` with the correct bot token on the correct port. No manual `server.ts` needed — one process, one token, full isolation.
-
-**Important:** Do NOT start a manual `server.ts` alongside `tgpin`. The built-in channel handles everything. Starting both creates two pollers on the same token, causing 409 conflicts and lost messages.
-
-### Spin up / kill
-
-```bash
-# Launch agent in tmux
-tmux new-session -d -s myagent "$HOME/agents/myagent/tg"
-
-# Kill agent
-tmux kill-session -t myagent
-```
-
-Each agent is fully independent. Kill one, the others keep running. Scale to as many agents as you have bot tokens.
+Outbound is checked too: every tool call re-validates the target chat against the allowlist, and the file sender refuses to attach anything from inside the state directory — so `access.json` and `.env` can't be talked out of the bot.
 
 ---
 
-## Architecture Decisions
+## What the agent can do
 
-### Why session-pinned?
-An always-on bot means an always-on Claude session consuming resources and potentially acting on stale context. The pin design means the bot is live when you want it, dead when you don't. This is a feature, not a limitation.
+| Tool | |
+|---|---|
+| `reply` | Send text. Auto-chunks past Telegram's 4096 limit on paragraph, then line, then word boundaries. Attaches files by absolute path — images inline, everything else as documents, 50 MB cap. Optional MarkdownV2, optional threaded reply. |
+| `react` | Emoji reaction on a message. |
+| `download_attachment` | Pull a file to the local inbox and return the path. |
+| `edit_message` | Rewrite a message already sent — progress updates without spamming. Edits don't push-notify, so send a fresh message when the long job finally lands. |
 
-### Why two files (server.ts + proxy.ts)?
-The server runs as a systemd unit and holds the Telegram polling connection. The proxy is spawned by Claude as a stdio MCP transport. Separating them means:
-- The server can restart independently of Claude
-- The proxy can reconnect to a running server
-- No polling state is lost during a Claude session restart
+Inbound handles text, photos, documents, voice, audio, video, video notes and stickers. Photos are downloaded automatically; everything else arrives with a `file_id` the agent can fetch on demand.
 
-### Why not a webhook?
-Webhooks need a public URL, TLS, and port forwarding. Long polling works anywhere — behind NAT, on a laptop, on a VPS. Zero infrastructure beyond the machine itself.
+### Permission prompts
 
-### One poller per token
-Telegram's Bot API returns 409 Conflict if two processes poll the same token. The lock file (`pinned.lock`) enforces exactly one poller. If a session crashes without cleanup, the next `tgpin` detects the stale PID and reclaims the lock.
+When the agent needs approval, the prompt goes to your phone as three buttons — **See more**, **Allow**, **Deny**. "See more" expands the full tool input before you decide. Only allowlisted users can press them. You can also answer in text: `y a1b2c` or `n a1b2c`.
+
+---
+
+## Staying up
+
+| Failure | What happens |
+|---|---|
+| Session closes or `/clear`s | Poller keeps running. Messages queue, next session drains them. |
+| A stale poller holds the token | New one finds the old PID, SIGTERMs it, takes over. |
+| Telegram 409s | Backs off up to 15s and retries; gives up after 8 tries rather than fighting forever. |
+| Server dies | `Restart=always`, 3s later it's back. |
+| SSE drops | Proxy reconnects every 2s, re-acquires the pin, server replays the queue. 15s heartbeat detects half-open sockets. |
+| Proxy's SSE loop crashes outright | Caught and restarted after 5s. |
+| `access.json` is corrupt | Moved aside, fresh defaults, bot keeps running. |
 
 ---
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `server.ts` | Standalone MCP HTTP server — polls Telegram, queues messages, serves tools |
-| `proxy.ts` | Stdio MCP proxy — bridges server ↔ Claude, manages pin lifecycle |
-| `package.json` | Dependencies: grammy, MCP SDK, express, zod |
-| `tgpin` | Launcher script — acquires pin, starts Claude with the channel loaded |
-| `telegram-mcp.service` | systemd user unit for the server |
+```
+tg                      launcher — resolves runtime + bot, exports the contract, execs
+runtimes/               one executable per runtime: claude, opencode, anon
+server.ts               poller, gate, MCP HTTP server, permission UI
+proxy.ts                stdio MCP server, tool implementations, pin, SSE client
+telegram-mcp@.service   templated systemd unit — one instance per bot
+package.json            bun deps: grammy, express, MCP SDK, zod
+```
+
+State, outside the repo:
+
+```
+~/.claude/channels/telegram/
+├── bots.json                name → port
+├── runtimes/                one executable per runtime
+└── <bot>/
+    ├── .env                 token + port  (0600)
+    ├── access.json          policy + allowlist
+    ├── bot.pid              running poller
+    ├── pinned.lock          session that owns the bot
+    └── inbox/               downloaded attachments
+```
 
 ---
 
 ## License
 
-Apache-2.0 (same as the upstream Claude Code Telegram plugin).
-
----
-
-## Contact
-
-- GitHub: [Swigler](https://github.com/Swigler)
+Apache-2.0.

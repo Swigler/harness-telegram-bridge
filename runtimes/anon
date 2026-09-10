@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+cd /tmp
+exec claude --model opus --permission-mode acceptEdits \
+  --dangerously-load-development-channels server:telegram-proxy "$@"

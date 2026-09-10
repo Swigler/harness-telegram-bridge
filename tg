@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# tg <runtime> <bot> [extra args...]
+#
+# Examples:
+#   tg claude buzz          # Claude session on buzz bot
+#   tg opencode gherutza    # OpenCode session on gherutza bot
+#   tg anon buzz            # blank Claude, no project context
+#
+# Bots:    ~/.claude/channels/telegram/bots.json  (name → port)
+# Runtimes: ~/.claude/channels/telegram/runtimes/ (one script per runtime)
+# Tokens:  ~/.claude/channels/telegram/<bot>/.env  (TELEGRAM_BOT_TOKEN + TELEGRAM_MCP_PORT)
+set -uo pipefail
+
+BASE_DIR="$HOME/.claude/channels/telegram"
+BOTS_JSON="$BASE_DIR/bots.json"
+RUNTIMES_DIR="$BASE_DIR/runtimes"
+
+# ── Parse args ────────────────────────────────────────────────────────────
+RUNTIME="${1:-}"
+BOT_NAME="${2:-}"
+shift 2 2>/dev/null || true
+
+if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" || -z "$RUNTIME" || -z "$BOT_NAME" ]]; then
+  cat >&2 << 'HELP'
+tg — Telegram bot launcher
+
+Usage: tg <runtime> <bot> [extra args...]
+
+Examples:
+  tg claude bot1           Claude Code session on bot1
+  tg opencode bot2         OpenCode session on bot2
+  tg anon bot1             Blank Claude (no project context)
+  tg claude bot1 --continue   Resume last conversation
+
+  tg setup                 Add a new bot (interactive wizard)
+  tg setup mybot           Add bot named "mybot"
+HELP
+  echo "" >&2
+  if [[ -d "$RUNTIMES_DIR" ]]; then
+    echo "Runtimes: $(ls "$RUNTIMES_DIR" | tr '\n' ' ')" >&2
+  fi
+  if [[ -f "$BOTS_JSON" ]]; then
+    echo "Bots:     $(python3 -c "import json; print(' '.join(json.load(open('$BOTS_JSON'))))")" >&2
+  fi
+  exit 0
+fi
+
+# ── Setup wizard ──────────────────────────────────────────────────────────
+if [[ "$RUNTIME" == "setup" ]]; then
+  BOT="${BOT_NAME:-}"
+
+  # Bot name
+  if [[ -z "$BOT" ]]; then
+    read -rp "Bot name (e.g. bot1, mybot): " BOT
+  fi
+  if [[ -z "$BOT" ]]; then
+    echo "Bot name cannot be empty." >&2
+    exit 1
+  fi
+  if [[ "$BOT" =~ [^a-zA-Z0-9_-] ]]; then
+    echo "Bot name must be alphanumeric (a-z, 0-9, -, _)." >&2
+    exit 1
+  fi
+
+  BOT_DIR="$BASE_DIR/$BOT"
+  if [[ -f "$BOT_DIR/.env" ]]; then
+    echo "Bot '$BOT' already exists at $BOT_DIR" >&2
+    exit 1
+  fi
+
+  # Token
+  read -rp "Telegram bot token (from @BotFather): " TOKEN
+  if [[ -z "$TOKEN" ]]; then
+    echo "Token cannot be empty." >&2
+    exit 1
+  fi
+
+  # Verify token
+  echo "Verifying token..."
+  BOT_INFO=$(curl -sf "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
+  if [[ $? -ne 0 ]] || ! echo "$BOT_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok']" 2>/dev/null; then
+    echo "Invalid token — getMe failed." >&2
+    exit 1
+  fi
+  BOT_USERNAME=$(echo "$BOT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['username'])")
+  echo "Token valid — @$BOT_USERNAME"
+
+  # Port — auto-assign next available
+  if [[ -f "$BOTS_JSON" ]]; then
+    NEXT_PORT=$(python3 -c "
+import json
+b = json.load(open('$BOTS_JSON'))
+ports = [v['port'] for v in b.values()]
+print(max(ports) + 1)
+")
+  else
+    NEXT_PORT=3456
+  fi
+  read -rp "Port [$NEXT_PORT]: " PORT
+  PORT="${PORT:-$NEXT_PORT}"
+
+  # Your Telegram user ID — the allowlist is gated on it. Default: whatever an existing bot uses.
+  DEFAULT_ID=$(python3 -c "
+import glob, json
+for f in sorted(glob.glob('$BASE_DIR/*/access.json')):
+    try:
+        ids = json.load(open(f)).get('allowFrom') or []
+    except Exception:
+        continue
+    if ids:
+        print(ids[0]); break
+" 2>/dev/null)
+  read -rp "Your Telegram user ID${DEFAULT_ID:+ [$DEFAULT_ID]} (ask @userinfobot): " ALLOW_ID
+  ALLOW_ID="${ALLOW_ID:-$DEFAULT_ID}"
+  if [[ ! "$ALLOW_ID" =~ ^[0-9]+$ ]]; then
+    echo "Telegram user ID must be numeric." >&2
+    exit 1
+  fi
+
+  # Create state dir + .env
+  mkdir -p "$BOT_DIR"
+  cat > "$BOT_DIR/.env" << EOF
+TELEGRAM_BOT_TOKEN=$TOKEN
+TELEGRAM_MCP_PORT=$PORT
+EOF
+  chmod 600 "$BOT_DIR/.env"
+
+  # Create access.json with default allowlist
+  cat > "$BOT_DIR/access.json" << EOF
+{"dmPolicy":"allowlist","allowFrom":["$ALLOW_ID"]}
+EOF
+
+  # Update bots.json
+  if [[ -f "$BOTS_JSON" ]]; then
+    python3 -c "
+import json
+b = json.load(open('$BOTS_JSON'))
+b['$BOT'] = {'port': $PORT}
+json.dump(b, open('$BOTS_JSON', 'w'), indent=2)
+print('Updated bots.json')
+"
+  else
+    echo "{\"$BOT\": {\"port\": $PORT}}" > "$BOTS_JSON"
+    echo "Created bots.json"
+  fi
+
+  # Enable + start systemd unit
+  systemctl --user enable "telegram-mcp@${BOT}.service" 2>/dev/null
+  systemctl --user start "telegram-mcp@${BOT}.service" 2>/dev/null
+
+  echo ""
+  echo "Done! Bot '$BOT' (@$BOT_USERNAME) ready on port $PORT."
+  echo ""
+  echo "  tg claude $BOT       # Claude Code session"
+  echo "  tg opencode $BOT     # OpenCode session"
+  echo "  tg anon $BOT         # Blank Claude session"
+  exit 0
+fi
+
+# ── Resolve runtime ───────────────────────────────────────────────────────
+RUNTIME_SCRIPT="$RUNTIMES_DIR/$RUNTIME"
+if [[ ! -x "$RUNTIME_SCRIPT" ]]; then
+  echo "Unknown runtime '$RUNTIME'." >&2
+  echo "Available: $(ls "$RUNTIMES_DIR" | tr '\n' ' ')" >&2
+  exit 1
+fi
+
+# ── Resolve bot ───────────────────────────────────────────────────────────
+if [[ ! -f "$BOTS_JSON" ]]; then
+  echo "No bots.json at $BOTS_JSON" >&2
+  exit 1
+fi
+
+# Parse port from bots.json with pure bash (no jq, no bun)
+PORT=$(python3 -c "import json,sys; b=json.load(open('$BOTS_JSON')); print(b['$BOT_NAME']['port'])" 2>/dev/null)
+if [[ -z "$PORT" ]]; then
+  echo "Unknown bot '$BOT_NAME'." >&2
+  echo "Available: $(python3 -c "import json; print(' '.join(json.load(open('$BOTS_JSON'))))")" >&2
+  exit 1
+fi
+
+STATE_DIR="$BASE_DIR/$BOT_NAME"
+
+if [[ ! -f "$STATE_DIR/.env" ]]; then
+  echo "No .env at $STATE_DIR/.env" >&2
+  echo "Create it with: TELEGRAM_BOT_TOKEN=<token>" >&2
+  echo "                TELEGRAM_MCP_PORT=$PORT" >&2
+  exit 1
+fi
+
+# ── Pin check ─────────────────────────────────────────────────────────────
+LOCK="$STATE_DIR/pinned.lock"
+if [[ -f "$LOCK" ]] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "Bot '$BOT_NAME' is already pinned to pid $(cat "$LOCK")." >&2
+  echo "Close that session first, or: kill $(cat "$LOCK")" >&2
+  exit 1
+fi
+rm -f "$LOCK"
+
+# ── Ensure poller is running ─────────────────────────────────────────────
+POLLER_UNIT="telegram-mcp@${BOT_NAME}.service"
+systemctl --user start "$POLLER_UNIT" 2>/dev/null
+
+# ── Export env for the proxy ──────────────────────────────────────────────
+export TELEGRAM_PIN=1
+export TELEGRAM_STATE_DIR="$STATE_DIR"
+export TELEGRAM_MCP_PORT="$PORT"
+export TELEGRAM_MCP_URL="http://localhost:$PORT"
+export TELEGRAM_POLLER_UNIT="$POLLER_UNIT"
+
+echo "tg: $RUNTIME → $BOT_NAME (port $PORT)"
+exec "$RUNTIME_SCRIPT" "$@"
