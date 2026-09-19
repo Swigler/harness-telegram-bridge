@@ -52,6 +52,170 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
+// ── OpenCode backend state ──────────────────────────────────────────────
+type RuntimeConfig =
+  | { runtime: 'claude' }
+  | { runtime: 'opencode'; url: string; dir: string }
+
+let activeRuntime: RuntimeConfig = { runtime: 'claude' }
+const opencodeSessions = new Map<string, string>()   // chat_id → session_id
+
+// ── OpenCode dispatch ────────────────────────────────────────────────
+async function dispatchToOpencode(text: string, chatId: string): Promise<void> {
+  if (activeRuntime.runtime !== 'opencode') return
+  const { url } = activeRuntime
+
+  let sessionId = opencodeSessions.get(chatId)
+  if (!sessionId) {
+    const res = await fetch(`${url}/session`, { method: 'POST' })
+    if (!res.ok) throw new Error(`opencode session create: ${res.status} ${await res.text()}`)
+    const body = await res.json() as { id: string }
+    sessionId = body.id
+    opencodeSessions.set(chatId, sessionId)
+    process.stderr.write(`telegram channel: opencode session ${sessionId} for chat ${chatId}\n`)
+  }
+
+  const res = await fetch(`${url}/session/${sessionId}/prompt_async`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parts: [{ type: 'text', text }] }),
+  })
+  if (!res.ok) {
+    // Session may have expired — clear and retry once
+    if (res.status === 404) {
+      opencodeSessions.delete(chatId)
+      return dispatchToOpencode(text, chatId)
+    }
+    throw new Error(`opencode prompt: ${res.status} ${await res.text()}`)
+  }
+}
+
+// Accumulates streaming text parts per session, flushes to Telegram on idle.
+const opencodePartBuffers = new Map<string, string>()
+const opencodeUserMsgs = new Set<string>()  // "sessionID:messageID" — skip user echo
+
+let opencodeAbort: AbortController | null = null
+
+async function opencodeEventLoop(url: string): Promise<void> {
+  opencodeAbort?.abort()
+  const ac = new AbortController()
+  opencodeAbort = ac
+  process.stderr.write(`telegram channel: opencode SSE connecting to ${url}/event\n`)
+
+  try {
+    const res = await fetch(`${url}/event`, {
+      signal: ac.signal,
+      headers: { Accept: 'text/event-stream' },
+    })
+    if (!res.ok || !res.body) throw new Error(`SSE connect failed: ${res.status}`)
+
+    process.stderr.write(`telegram channel: opencode SSE connected\n`)
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+
+      let idx: number
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const block = buf.slice(0, idx)
+        buf = buf.slice(idx + 2)
+        const dataLine = block.split('\n').find(l => l.startsWith('data: '))
+        if (!dataLine) continue
+
+        try {
+          const data = JSON.parse(dataLine.slice(6)) as {
+            type: string
+            properties: Record<string, unknown>
+          }
+          handleOpencodeEvent(data)
+        } catch {}
+      }
+    }
+  } catch (err) {
+    if (ac.signal.aborted) return
+    process.stderr.write(`telegram channel: opencode SSE error: ${err}\n`)
+  }
+
+  // Reconnect if still in opencode mode
+  if (activeRuntime.runtime === 'opencode' && !ac.signal.aborted) {
+    process.stderr.write('telegram channel: opencode SSE reconnecting in 3s\n')
+    setTimeout(() => {
+      if (activeRuntime.runtime === 'opencode') void opencodeEventLoop(activeRuntime.url)
+    }, 3000)
+  }
+}
+
+function handleOpencodeEvent(data: { type: string; properties: Record<string, unknown> }): void {
+  if (data.type === 'message.part.updated') {
+    const props = data.properties as {
+      sessionID: string
+      part: { type: string; text?: string; messageID: string }
+    }
+    if (props.part.type === 'text' && props.part.text && props.part.text.length > 0) {
+      const key = `${props.sessionID}:${props.part.messageID}`
+      if (!opencodeUserMsgs.has(key)) {
+        opencodePartBuffers.set(props.sessionID, props.part.text)
+      }
+    }
+  }
+
+  if (data.type === 'message.updated') {
+    const props = data.properties as {
+      sessionID: string
+      info: { id: string; role: string }
+    }
+    if (props.info.role === 'user') {
+      opencodeUserMsgs.add(`${props.sessionID}:${props.info.id}`)
+    }
+  }
+
+  if (data.type === 'session.idle') {
+    const props = data.properties as { sessionID: string }
+    const sid = props.sessionID
+    const text = opencodePartBuffers.get(sid)
+    opencodePartBuffers.delete(sid)
+    process.stderr.write(`telegram channel: session.idle sid=${sid} buf=${text?.length ?? 0} chars\n`)
+    if (!text) return
+
+    let targetChat: string | undefined
+    for (const [chatId, sessId] of opencodeSessions) {
+      if (sessId === sid) { targetChat = chatId; break }
+    }
+    if (!targetChat) return
+
+    const access = loadAccess()
+    const limit = Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT)
+    const mode = access.chunkMode ?? 'newline'
+    const chunks = chunk(text, limit, mode)
+    for (const c of chunks) {
+      void bot.api.sendMessage(targetChat, c).catch(err => {
+        process.stderr.write(`telegram channel: opencode reply send failed: ${err}\n`)
+      })
+    }
+  }
+
+  if (data.type === 'session.error') {
+    const props = data.properties as {
+      sessionID: string
+      error: { message?: string; data?: { message?: string } }
+    }
+    const sid = props.sessionID
+    const errMsg = props.error?.data?.message ?? props.error?.message ?? 'unknown error'
+
+    let targetChat: string | undefined
+    for (const [chatId, sessId] of opencodeSessions) {
+      if (sessId === sid) { targetChat = chatId; break }
+    }
+    if (targetChat) {
+      void bot.api.sendMessage(targetChat, `⚠️ OpenCode: ${errMsg}`).catch(() => {})
+    }
+  }
+}
+
 // Kill any stale poller holding the Telegram token slot (409 Conflict).
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
@@ -646,6 +810,39 @@ app.get('/events', (req, res) => {
   })
 })
 
+app.post('/backend', (req, res) => {
+  const { runtime, url, dir } = req.body as { runtime: string; url?: string; dir?: string }
+
+  if (runtime === 'claude') {
+    opencodeAbort?.abort()
+    activeRuntime = { runtime: 'claude' }
+    opencodeSessions.clear()
+    opencodePartBuffers.clear()
+    opencodeUserMsgs.clear()
+    process.stderr.write('telegram channel: switched to claude backend\n')
+    res.json({ ok: true, runtime: 'claude' })
+    return
+  }
+
+  if (runtime === 'opencode') {
+    if (!url) { res.status(400).json({ error: 'url required for opencode runtime' }); return }
+    activeRuntime = { runtime: 'opencode', url, dir: dir ?? '.' }
+    opencodeSessions.clear()
+    opencodePartBuffers.clear()
+    opencodeUserMsgs.clear()
+    void opencodeEventLoop(url)
+    process.stderr.write(`telegram channel: switched to opencode backend at ${url}\n`)
+    res.json({ ok: true, runtime: 'opencode', url })
+    return
+  }
+
+  res.status(400).json({ error: `unknown runtime: ${runtime}` })
+})
+
+app.get('/backend', (_req, res) => {
+  res.json(activeRuntime)
+})
+
 app.listen(PORT, () => {
   process.stderr.write(`telegram channel: MCP HTTP server listening on port ${PORT}\n`)
 })
@@ -945,6 +1142,15 @@ async function handleInbound(
   }
 
   const imagePath = downloadImage ? await downloadImage() : undefined
+
+  // Route to active backend
+  if (activeRuntime.runtime === 'opencode') {
+    dispatchToOpencode(text, chat_id).catch(err => {
+      process.stderr.write(`telegram channel: opencode dispatch error: ${err}\n`)
+      void bot.api.sendMessage(chat_id, `⚠️ OpenCode error: ${err}`).catch(() => {})
+    })
+    return
+  }
 
   pushNotification({
     method: 'notifications/claude/channel',
