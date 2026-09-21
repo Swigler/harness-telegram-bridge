@@ -153,7 +153,7 @@ function chunk(text: string, limit: number): string[] {
 
 // MCP stdio server for Claude
 const server = new Server(
-  { name: 'telegram', version: '1.0.0' },
+  { name: 'telegram-proxy', version: '2.0.0' },
   {
     capabilities: {
       tools: {},
@@ -162,7 +162,9 @@ const server = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back.',
+      'Messages from Telegram arrive via the wait_for_message tool. Call it to receive inbound messages. After replying, call wait_for_message again to wait for the next message. Always keep a wait_for_message call active — this is how you receive Telegram messages.',
+      '',
+      'Each message is a JSON object with fields: content (text), chat_id, message_id, user, user_id, ts. May also include image_path (Read the file), attachment_file_id (call download_attachment), attachment_kind, attachment_mime, attachment_name.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -224,6 +226,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: { type: 'string', enum: ['text', 'markdownv2'] },
         },
         required: ['chat_id', 'message_id', 'text'],
+      },
+    },
+    {
+      name: 'wait_for_message',
+      description: 'Block until a Telegram message arrives (up to timeout_ms, default 30000). Returns array of messages or empty array on timeout. Call this in a loop to receive messages.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          timeout_ms: { type: 'number', description: 'Max wait in ms (default 30000, max 120000).' },
+        },
       },
     },
   ],
@@ -300,6 +312,36 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         )
         return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
       }
+      case 'wait_for_message': {
+        const timeout = Math.min(Math.max(Number(args.timeout_ms) || 30000, 1000), 120000)
+        const deadline = Date.now() + timeout
+        const collected: unknown[] = []
+        waitActive = true
+        while (Date.now() < deadline) {
+          try {
+            const res = await fetch(`${HTTP_SERVER}/poll`)
+            if (res.ok) {
+              const msgs = await res.json() as unknown[]
+              for (const m of msgs) {
+                const params = (m as any)?.params
+                if (params) {
+                  collected.push({
+                    content: params.content,
+                    ...params.meta,
+                  })
+                }
+              }
+              if (collected.length > 0) break
+            }
+          } catch {}
+          await new Promise(r => setTimeout(r, 1000))
+        }
+        waitActive = false
+        if (collected.length === 0) {
+          return { content: [{ type: 'text', text: 'no messages (timeout)' }] }
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(collected) }] }
+      }
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }], isError: true }
     }
@@ -330,71 +372,40 @@ server.setNotificationHandler(
 )
 
 await server.connect(new StdioServerTransport())
+process.stderr.write(`telegram proxy: ready (pid ${process.pid})\n`)
 
-// SSE loop — receive inbound Telegram notifications and push to Claude.
-// Re-acquires pin on every reconnect so a respawned proxy (after /clear) recovers.
-async function sseConnect(): Promise<void> {
-  // (Re-)acquire pin before connecting. If stale lock from dead process, take over.
+// Push loop — drains /poll and forwards as channel notifications.
+// This is the primary delivery path when Claude Code is started with
+// --dangerously-load-development-channels server:telegram-proxy.
+// Pauses while wait_for_message is active so they don't race.
+let waitActive = false
+
+async function pollLoop(): Promise<void> {
   if (!pinned) {
     pinned = acquirePin()
-    if (pinned) {
-      process.stderr.write(`telegram proxy: re-acquired pin (pid ${process.pid}) — bot is live\n`)
-    } else {
-      throw new Error('cannot acquire pin — another session holds it')
-    }
+    if (pinned) process.stderr.write(`telegram proxy: pinned (pid ${process.pid})\n`)
   }
 
-  const res = await fetch(`${HTTP_SERVER}/events`)
-  if (!res.ok || !res.body) throw new Error(`SSE connect failed: ${res.status}`)
-  process.stderr.write('telegram proxy: SSE connected\n')
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        if (line.startsWith(':')) continue  // SSE comment (heartbeat ping)
-        if (!line.startsWith('data: ')) continue
-        try {
-          const notification = JSON.parse(line.slice(6))
-          server.notification(notification).catch(() => {})
-        } catch {}
-      }
-    }
-  } finally {
-    reader.cancel().catch(() => {})
-  }
-}
-
-async function sseLoop(): Promise<void> {
   while (true) {
-    try {
-      await sseConnect()
-      process.stderr.write('telegram proxy: SSE stream ended, reconnecting in 2s\n')
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (msg.includes('cannot acquire pin')) {
-        process.stderr.write(`telegram proxy: ${msg} — will retry in 10s\n`)
-        await new Promise(r => setTimeout(r, 10_000))
-        continue
-      }
-      process.stderr.write(`telegram proxy: SSE error (${msg}), reconnecting in 2s\n`)
+    if (!waitActive) {
+      try {
+        const res = await fetch(`${HTTP_SERVER}/poll`)
+        if (res.ok) {
+          const msgs = await res.json() as unknown[]
+          for (const notification of msgs) {
+            server.notification(notification as any).catch(() => {})
+          }
+        }
+        if (!pinned) {
+          pinned = acquirePin()
+          if (pinned) process.stderr.write(`telegram proxy: re-acquired pin (pid ${process.pid})\n`)
+        }
+      } catch {}
     }
-    await new Promise(r => setTimeout(r, 2000))
+    await new Promise(r => setTimeout(r, 1000))
   }
 }
 
-// Always start the SSE loop. Restart if the promise ever escapes the inner try/catch.
-;(function keepAlive() {
-  sseLoop().catch(err => {
-    process.stderr.write(`telegram proxy: sseLoop crashed (${err}), restarting in 5s\n`)
-    setTimeout(keepAlive, 5000)
-  })
-})()
+pollLoop().catch(err => {
+  process.stderr.write(`telegram proxy: pollLoop crashed: ${err}\n`)
+})

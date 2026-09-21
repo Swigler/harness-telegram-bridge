@@ -20,32 +20,9 @@ RUNTIME="${1:-}"
 BOT_NAME="${2:-}"
 shift 2 2>/dev/null || true
 
-if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" || -z "$RUNTIME" || -z "$BOT_NAME" ]]; then
-  cat >&2 << 'HELP'
-tg — Telegram bot launcher
+# ── Subcommands (intercept before help check — these accept empty BOT_NAME) ──
 
-Usage: tg <runtime> <bot> [extra args...]
-
-Examples:
-  tg claude bot1           Claude Code session on bot1
-  tg opencode bot2         OpenCode session on bot2
-  tg anon bot1             Blank Claude (no project context)
-  tg claude bot1 --continue   Resume last conversation
-
-  tg setup                 Add a new bot (interactive wizard)
-  tg setup mybot           Add bot named "mybot"
-HELP
-  echo "" >&2
-  if [[ -d "$RUNTIMES_DIR" ]]; then
-    echo "Runtimes: $(ls "$RUNTIMES_DIR" | tr '\n' ' ')" >&2
-  fi
-  if [[ -f "$BOTS_JSON" ]]; then
-    echo "Bots:     $(python3 -c "import json; print(' '.join(json.load(open('$BOTS_JSON'))))")" >&2
-  fi
-  exit 0
-fi
-
-# ── Setup wizard ──────────────────────────────────────────────────────────
+# Setup wizard
 if [[ "$RUNTIME" == "setup" ]]; then
   BOT="${BOT_NAME:-}"
 
@@ -154,6 +131,154 @@ print('Updated bots.json')
   echo "  tg claude $BOT       # Claude Code session"
   echo "  tg opencode $BOT     # OpenCode session"
   echo "  tg anon $BOT         # Blank Claude session"
+  exit 0
+fi
+
+# ── Always-on daemon: tg start <runtime> <bot> [workdir] ──────────────────
+if [[ "$RUNTIME" == "start" ]]; then
+  DAEMON_RT="$BOT_NAME"
+  DAEMON_BOT="${1:-}"
+  DAEMON_DIR="${2:-$PWD}"
+  shift 2 2>/dev/null || shift 1 2>/dev/null || true
+
+  if [[ -z "$DAEMON_RT" || -z "$DAEMON_BOT" ]]; then
+    echo "Usage: tg start <runtime> <bot> [workdir]" >&2
+    echo "  e.g. tg start claude buzz" >&2
+    exit 1
+  fi
+
+  if [[ ! "$DAEMON_RT" =~ ^(claude|kimi|opencode)$ ]]; then
+    echo "Daemon runtime must be claude, kimi, or opencode." >&2
+    exit 1
+  fi
+
+  # Verify bot exists
+  if [[ ! -f "$BASE_DIR/$DAEMON_BOT/.env" ]]; then
+    echo "Bot '$DAEMON_BOT' not found. Run: tg setup $DAEMON_BOT" >&2
+    exit 1
+  fi
+
+  UNIT="tg-daemon@${DAEMON_RT}-${DAEMON_BOT}.service"
+  POLLER="telegram-mcp@${DAEMON_BOT}.service"
+
+  # Stop MCP poller — two pollers on same token = 409
+  systemctl --user stop "$POLLER" 2>/dev/null
+  systemctl --user disable "$POLLER" 2>/dev/null
+
+  # Check no other daemon on this bot
+  EXISTING=$(systemctl --user list-units --type=service --state=running --no-legend 2>/dev/null \
+    | grep "tg-daemon@.*-${DAEMON_BOT}\.service" \
+    | grep -v "$UNIT" \
+    | awk '{print $1}')
+  if [[ -n "$EXISTING" ]]; then
+    echo "Bot '$DAEMON_BOT' already running: $EXISTING" >&2
+    echo "Stop it first: tg stop $DAEMON_BOT" >&2
+    exit 1
+  fi
+
+  # Set work directory via environment override
+  mkdir -p "$HOME/.config/systemd/user/tg-daemon@${DAEMON_RT}-${DAEMON_BOT}.service.d"
+  cat > "$HOME/.config/systemd/user/tg-daemon@${DAEMON_RT}-${DAEMON_BOT}.service.d/workdir.conf" << EOF
+[Service]
+Environment="TG_WORK_DIR=$DAEMON_DIR"
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT" 2>/dev/null
+  systemctl --user start "$UNIT"
+
+  echo "tg: started $DAEMON_RT on $DAEMON_BOT (always-on)"
+  systemctl --user status "$UNIT" --no-pager 2>&1 | head -5
+  exit 0
+fi
+
+# ── Stop daemon: tg stop <bot> ────────────────────────────────────────────
+if [[ "$RUNTIME" == "stop" ]]; then
+  STOP_BOT="$BOT_NAME"
+  if [[ -z "$STOP_BOT" ]]; then
+    echo "Usage: tg stop <bot>" >&2
+    exit 1
+  fi
+
+  # Find and stop any daemon on this bot
+  UNITS=$(systemctl --user list-units --type=service --no-legend 2>/dev/null \
+    | grep "tg-daemon@.*-${STOP_BOT}\.service" \
+    | awk '{print $1}')
+
+  if [[ -z "$UNITS" ]]; then
+    echo "No daemon running on '$STOP_BOT'." >&2
+    exit 1
+  fi
+
+  for u in $UNITS; do
+    systemctl --user stop "$u"
+    systemctl --user disable "$u" 2>/dev/null
+    echo "Stopped: $u"
+  done
+
+  # Re-enable MCP poller for dev bridge use
+  POLLER="telegram-mcp@${STOP_BOT}.service"
+  systemctl --user enable "$POLLER" 2>/dev/null
+  systemctl --user start "$POLLER" 2>/dev/null
+  echo "Restarted MCP poller: $POLLER"
+  exit 0
+fi
+
+# ── Daemon status: tg status ─────────────────────────────────────────────
+if [[ "$RUNTIME" == "status" ]]; then
+  echo "=== Daemons ==="
+  systemctl --user list-units --type=service --no-legend 2>/dev/null \
+    | grep "tg-daemon@" \
+    | awk '{printf "  %-40s %s\n", $1, $3}'
+
+  echo ""
+  echo "=== MCP Pollers ==="
+  systemctl --user list-units --type=service --no-legend 2>/dev/null \
+    | grep "telegram-mcp@" \
+    | awk '{printf "  %-40s %s\n", $1, $3}'
+
+  echo ""
+  echo "=== Bots ==="
+  if [[ -f "$BOTS_JSON" ]]; then
+    python3 -c "import json; [print(f'  {k}') for k in json.load(open('$BOTS_JSON'))]"
+  fi
+  exit 0
+fi
+
+# Dispatch (agent management)
+if [[ "$RUNTIME" == "dispatch" ]]; then
+  exec "$HOME/agents/dispatch" "$BOT_NAME" "$@"
+fi
+
+# ── Help (after subcommands, so tg setup / tg dispatch aren't swallowed) ──
+if [[ "$RUNTIME" == "help" || "$RUNTIME" == "--help" || "$RUNTIME" == "-h" || -z "$RUNTIME" || -z "$BOT_NAME" ]]; then
+  cat >&2 << 'HELP'
+tg — Telegram bot launcher
+
+Interactive (MCP bridge, needs terminal):
+  tg claude buzz           Claude Code session on buzz
+  tg anon buzz             Blank Claude (no project context)
+
+Always-on daemons (no terminal needed):
+  tg start kimi preotzel       Start Kimi daemon on preotzel
+  tg start opencode opncd123   Start OpenCode daemon on opncd123
+  tg start claude buzz         Start Claude daemon (needs ANTHROPIC_API_KEY)
+  tg stop preotzel             Stop daemon, re-enable MCP poller
+  tg status                    Show all daemons, pollers, and bots
+
+Any runtime on any bot. Swap anytime: tg stop <bot>, tg start <runtime> <bot>.
+
+Setup:
+  tg setup                 Add a new bot (interactive wizard)
+  tg setup mybot           Add bot named "mybot"
+HELP
+  echo "" >&2
+  if [[ -d "$RUNTIMES_DIR" ]]; then
+    echo "Runtimes: $(ls "$RUNTIMES_DIR" | tr '\n' ' ')" >&2
+  fi
+  if [[ -f "$BOTS_JSON" ]]; then
+    echo "Bots:     $(python3 -c "import json; print(' '.join(json.load(open('$BOTS_JSON'))))")" >&2
+  fi
   exit 0
 fi
 

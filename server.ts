@@ -748,27 +748,13 @@ app.all('/mcp', async (req, res) => {
 
 await mcp.connect(transport)
 
-// SSE notification queue — proxy subscribes here; messages queued when no proxy connected.
-const sseClients = new Set<import('express').Response>()
+// Message queue — single delivery path. proxy drains via /poll.
 const pendingNotifications: unknown[] = []
 const MAX_QUEUE = 500
 
 function pushNotification(notification: unknown): void {
-  if (sseClients.size > 0) {
-    const data = `data: ${JSON.stringify(notification)}\n\n`
-    let delivered = false
-    for (const client of sseClients) {
-      try { client.write(data); delivered = true } catch { sseClients.delete(client) }
-    }
-    // If all clients were zombies, queue the message so the next reconnect gets it
-    if (!delivered) {
-      pendingNotifications.push(notification)
-      if (pendingNotifications.length > MAX_QUEUE) pendingNotifications.shift()
-    }
-  } else {
-    pendingNotifications.push(notification)
-    if (pendingNotifications.length > MAX_QUEUE) pendingNotifications.shift()
-  }
+  pendingNotifications.push(notification)
+  if (pendingNotifications.length > MAX_QUEUE) pendingNotifications.shift()
 }
 
 // Receives permission_request forwarded from proxy
@@ -788,26 +774,10 @@ app.post('/permission', (req, res) => {
   res.json({ ok: true })
 })
 
-app.get('/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream')
-  res.setHeader('Cache-Control', 'no-cache')
-  res.setHeader('Connection', 'keep-alive')
-  res.flushHeaders()
-  sseClients.add(res)
-  process.stderr.write(`telegram channel: proxy connected (${sseClients.size} clients)\n`)
-  // flush queued notifications
-  for (const n of pendingNotifications.splice(0)) {
-    res.write(`data: ${JSON.stringify(n)}\n\n`)
-  }
-  // Heartbeat — SSE comment every 15s so proxy can detect dead connections
-  const heartbeat = setInterval(() => {
-    try { res.write(':ping\n\n') } catch { clearInterval(heartbeat) }
-  }, 15_000)
-  req.on('close', () => {
-    clearInterval(heartbeat)
-    sseClients.delete(res)
-    process.stderr.write(`telegram channel: proxy disconnected (${sseClients.size} clients)\n`)
-  })
+// Poll endpoint — proxy's wait_for_message drains this. Single consumer, no races.
+app.get('/poll', (_req, res) => {
+  const msgs = pendingNotifications.splice(0)
+  res.json(msgs)
 })
 
 app.post('/backend', (req, res) => {
