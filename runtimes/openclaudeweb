@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# openclaudeweb — OpenClaude TUI in tmux, visible + interactive in browser via ttyd.
+# Telegram DMs are typed into the same tmux session, so the browser TUI is
+# both a display and an input surface.
+set -uo pipefail
+
+TTYD="$HOME/ttyd"
+WEB_PORT="${OPENCLAUDE_WEB_PORT:-7683}"
+BOT="${TELEGRAM_STATE_DIR##*/}"
+SESSION="openclaudeweb-${BOT}"
+OC_BIN="$HOME/.local/bin/openclaude"
+BRIDGE="$HOME/.claude/channels/telegram/openclaude-bridge.py"
+VENV="$HOME/.claude/channels/telegram/.venv/bin/python"
+
+if [[ ! -x "$TTYD" ]]; then
+  echo "tg: ttyd not found at $TTYD" >&2
+  exit 1
+fi
+
+if [[ ! -x "$OC_BIN" ]]; then
+  echo "tg: openclaude not found at $OC_BIN" >&2
+  exit 1
+fi
+
+# ── Kill stale processes for this bot ─────────────────────────────────────
+for pid in $(pgrep -f "openclaude-bridge.py ${BOT}" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+for pid in $(pgrep -f "ttyd -W -p ${WEB_PORT}" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+for pid in $(pgrep -f "ttyd -p ${WEB_PORT}" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+sleep 0.3
+
+# ── Stop the MCP poller: this runtime polls Telegram directly ──────────────
+if [[ -n "${TELEGRAM_POLLER_UNIT:-}" ]]; then
+  systemctl --user stop "$TELEGRAM_POLLER_UNIT" 2>/dev/null || true
+fi
+
+# ── Start OpenClaude in a detached tmux session ──────────────────────────────
+# LiteLLM env: DeepSeek free tier + paid fallback via localhost:8080
+tmux new-session -d -s "$SESSION" \
+  env CLAUDE_CODE_USE_OPENAI=1 \
+      OPENAI_BASE_URL=http://localhost:8080/v1 \
+      OPENAI_API_KEY="${LITELLM_KEY:-sk-1234}" \
+      OPENAI_MODEL=fast \
+  "$OC_BIN" --dangerously-skip-permissions "$@"
+
+# ── Start the Telegram bridge in the background ────────────────────────────
+"$VENV" "$BRIDGE" "$BOT" "$SESSION" "$PWD" &
+BRIDGE_PID=$!
+
+# ── Start ttyd in the background (do NOT exec, so cleanup traps run) ───────
+"$TTYD" -W -p "$WEB_PORT" tmux attach -t "$SESSION" &
+TTYD_PID=$!
+
+# ── Cleanup: kill children, drop tmux, restore MCP poller ──────────────────
+cleanup() {
+  kill "$TTYD_PID" 2>/dev/null || true
+  kill "$BRIDGE_PID" 2>/dev/null || true
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  if [[ -n "${TELEGRAM_POLLER_UNIT:-}" ]]; then
+    systemctl --user start "$TELEGRAM_POLLER_UNIT" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+echo "tg: OpenClaude TUI → http://localhost:$WEB_PORT"
+echo "tg: bot: $BOT — Telegram messages drive the TUI; browser is also interactive"
+
+# Block on ttyd. The shell stays alive so the trap fires on Ctrl+C.
+wait "$TTYD_PID"

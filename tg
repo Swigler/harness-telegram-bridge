@@ -147,8 +147,8 @@ if [[ "$RUNTIME" == "start" ]]; then
     exit 1
   fi
 
-  if [[ ! "$DAEMON_RT" =~ ^(claude|kimi|opencode)$ ]]; then
-    echo "Daemon runtime must be claude, kimi, or opencode." >&2
+  if [[ ! "$DAEMON_RT" =~ ^(claude|kimi|opencode|openclaude)$ ]]; then
+    echo "Daemon runtime must be claude, kimi, opencode, or openclaude." >&2
     exit 1
   fi
 
@@ -258,6 +258,11 @@ tg — Telegram bot launcher
 Interactive (MCP bridge, needs terminal):
   tg claude buzz           Claude Code session on buzz
   tg anon buzz             Blank Claude (no project context)
+  tg kimi preotzel         Kimi via daemon.py (foreground, SDK backend)
+  tg opencode opncd123     OpenCode via daemon.py (foreground, subprocess)
+  tg kimiweb preotzel      Kimi web UI session, mirrored to Telegram
+  tg kimittyd preotzel     Kimi TUI in tmux, browser via ttyd (:7682), Telegram drives it
+  tg claudeweb buzz        Claude Code TUI in browser (http://localhost:7681)
 
 Always-on daemons (no terminal needed):
   tg start kimi preotzel       Start Kimi daemon on preotzel

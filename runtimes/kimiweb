@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# kimittyd — Kimi TUI in tmux, visible + interactive in browser via ttyd.
+# Telegram DMs are typed into the same tmux session, so the browser TUI is
+# both a display and an input surface.
+set -uo pipefail
+
+TTYD="$HOME/ttyd"
+WEB_PORT="${KIMI_WEB_PORT:-7682}"
+BOT="${TELEGRAM_STATE_DIR##*/}"
+SESSION="kimittyd-${BOT}"
+KIMI="$HOME/.kimi-code/bin/kimi"
+BRIDGE="$HOME/.claude/channels/telegram/kimittyd-bridge.py"
+VENV="$HOME/.claude/channels/telegram/.venv/bin/python"
+
+if [[ ! -x "$TTYD" ]]; then
+  echo "tg: ttyd not found at $TTYD" >&2
+  exit 1
+fi
+
+if [[ ! -x "$KIMI" ]]; then
+  echo "tg: kimi not found at $KIMI" >&2
+  exit 1
+fi
+
+# ── Kill stale kimittyd processes for this bot ─────────────────────────────
+# A previous run may have left bridge/ttyd/tmux behind if it was SIGKILLed.
+for pid in $(pgrep -f "kimittyd-bridge.py ${BOT}" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+for pid in $(pgrep -f "ttyd -W -p ${WEB_PORT}" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+for pid in $(pgrep -f "ttyd -p ${WEB_PORT}" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+sleep 0.3
+
+# ── Stop the MCP poller: this runtime polls Telegram directly ──────────────
+if [[ -n "${TELEGRAM_POLLER_UNIT:-}" ]]; then
+  systemctl --user stop "$TELEGRAM_POLLER_UNIT" 2>/dev/null || true
+fi
+
+# ── Start Kimi in a detached tmux session ──────────────────────────────────
+tmux new-session -d -s "$SESSION" "$KIMI" --yolo "$@"
+
+# ── Start the Telegram bridge in the background ────────────────────────────
+"$VENV" "$BRIDGE" "$BOT" "$SESSION" "$PWD" &
+BRIDGE_PID=$!
+
+# ── Start ttyd in the background (do NOT exec, so cleanup traps run) ───────
+"$TTYD" -W -p "$WEB_PORT" tmux attach -t "$SESSION" &
+TTYD_PID=$!
+
+# ── Cleanup: kill children, drop tmux, restore MCP poller ──────────────────
+cleanup() {
+  kill "$TTYD_PID" 2>/dev/null || true
+  kill "$BRIDGE_PID" 2>/dev/null || true
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  if [[ -n "${TELEGRAM_POLLER_UNIT:-}" ]]; then
+    systemctl --user start "$TELEGRAM_POLLER_UNIT" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+echo "tg: Kimi TUI → http://localhost:$WEB_PORT"
+echo "tg: bot: $BOT — Telegram messages drive the TUI; browser is also interactive"
+
+# Block on ttyd. The shell stays alive so the trap fires on Ctrl+C.
+wait "$TTYD_PID"

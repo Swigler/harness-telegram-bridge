@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Foreground openclaude runtime for tg. Runs daemon.py directly — dies on close.
+set -uo pipefail
+
+source "$TELEGRAM_STATE_DIR/.env"
+
+# Stop MCP poller — two pollers on same token = 409
+systemctl --user stop "$TELEGRAM_POLLER_UNIT" 2>/dev/null
+
+trap 'systemctl --user start "$TELEGRAM_POLLER_UNIT" 2>/dev/null' EXIT
+
+DAEMON="$HOME/.claude/channels/telegram/daemon.py"
+VENV="$HOME/.claude/channels/telegram/.venv/bin/python"
+
+BOT=$(basename "$TELEGRAM_STATE_DIR")
+echo "tg: openclaude → $BOT (foreground, cwd $PWD)"
+exec "$VENV" "$DAEMON" openclaude "$BOT" "$PWD"
