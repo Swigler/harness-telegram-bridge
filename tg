@@ -260,13 +260,15 @@ Interactive (MCP bridge, needs terminal):
   tg anon buzz             Blank Claude (no project context)
   tg kimi preotzel         Kimi via daemon.py (foreground, SDK backend)
   tg opencode opncd123     OpenCode via daemon.py (foreground, subprocess)
-  tg kimiweb preotzel      Kimi web UI session, mirrored to Telegram
-  tg kimittyd preotzel     Kimi TUI in tmux, browser via ttyd (:7682), Telegram drives it
+  tg openclaude opncld123  OpenClaude via daemon.py (DeepSeek/LiteLLM)
+  tg kimiweb preotzel      Kimi TUI in tmux, browser via ttyd (:7682), Telegram drives it
+  tg openclaudeweb opncld123  OpenClaude TUI in tmux+ttyd (:7683)
   tg claudeweb buzz        Claude Code TUI in browser (http://localhost:7681)
 
 Always-on daemons (no terminal needed):
   tg start kimi preotzel       Start Kimi daemon on preotzel
   tg start opencode opncd123   Start OpenCode daemon on opncd123
+  tg start openclaude opncld123  Start OpenClaude daemon (DeepSeek/LiteLLM)
   tg start claude buzz         Start Claude daemon (needs ANTHROPIC_API_KEY)
   tg stop preotzel             Stop daemon, re-enable MCP poller
   tg status                    Show all daemons, pollers, and bots
